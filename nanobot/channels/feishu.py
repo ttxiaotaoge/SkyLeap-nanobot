@@ -18,6 +18,10 @@ from nanobot.config.schema import FeishuConfig
 try:
     import lark_oapi as lark
     from lark_oapi.api.im.v1 import (
+        CreateFileRequest,
+        CreateFileRequestBody,
+        CreateImageRequest,
+        CreateImageRequestBody,
         CreateMessageRequest,
         CreateMessageRequestBody,
         CreateMessageReactionRequest,
@@ -32,6 +36,8 @@ except ImportError:
     lark = None
     Emoji = None
     GetMessageResourceRequest = None
+    CreateImageRequest = None
+    CreateFileRequest = None
 
 # Message type display mapping
 MSG_TYPE_MAP = {
@@ -180,18 +186,19 @@ class FeishuChannel(BaseChannel):
                 "text/plain": ".txt",
                 "application/zip": ".zip",
                 "application/x-rar-compressed": ".rar",
+                "application/octet-stream": ".bin",  # Binary data
             }
             if mime_type in ext_map:
                 return ext_map[mime_type]
         
         type_map = {
             "image": ".jpg",
-            "file": "",
+            "file": ".bin",  # Default to .bin for unknown file types
             "audio": ".mp3",
             "video": ".mp4",
-            "media": "",
+            "media": ".bin",
         }
-        return type_map.get(msg_type, "")
+        return type_map.get(msg_type, ".bin")
     
     async def _download_file(self, file_key: str, msg_type: str, message_id: str) -> str | None:
         """
@@ -241,26 +248,291 @@ class FeishuChannel(BaseChannel):
                 file_bytes = file_content
             
             # Determine file extension
-            mime_type = getattr(response, 'mime_type', None)
-            ext = self._get_extension(msg_type, mime_type)
+            # Try to get mime_type from response data
+            mime_type = None
+            file_name = None
+            if hasattr(response, 'data') and response.data:
+                mime_type = getattr(response.data, 'mime_type', None)
+                file_name = getattr(response.data, 'file_name', None)
+            
+            # Try to extract extension from file_name first
+            ext = ""
+            if file_name:
+                ext = Path(file_name).suffix
+                logger.debug(f"Got extension from file_name: {ext}")
+            
+            # If no extension from file_name, try mime_type
+            if not ext:
+                ext = self._get_extension(msg_type, mime_type)
             
             # Create media directory in workspace (so AI can access it even with restrict_to_workspace)
             media_dir = self._workspace / "media"
             media_dir.mkdir(parents=True, exist_ok=True)
             
-            # Generate file path
-            file_path = media_dir / f"{file_key[:16]}{ext}"
+            # Generate file path - use file_name if available, otherwise use file_key
+            if file_name:
+                # Sanitize file name to avoid path traversal
+                safe_name = "".join(c for c in file_name if c.isalnum() or c in '._-')
+                file_path = media_dir / safe_name
+            else:
+                file_path = media_dir / f"{file_key[:16]}{ext}"
             
             # Write file content
             with open(file_path, 'wb') as f:
                 f.write(file_bytes)
             
-            logger.info(f"Downloaded {msg_type} file to {file_path}")
+            logger.info(f"Downloaded {msg_type} file to {file_path} (mime_type: {mime_type}, file_name: {file_name})")
             return str(file_path)
             
         except Exception as e:
             logger.error(f"Error downloading file from Feishu: {e}")
             return None
+    
+    def _upload_image_sync(self, file_path: str) -> str | None:
+        """
+        Sync helper for uploading image to Feishu.
+        
+        Args:
+            file_path: Local path to the image file
+            
+        Returns:
+            Image key if successful, None otherwise
+        """
+        if not self._client or not CreateImageRequest:
+            logger.warning("Feishu client or CreateImageRequest not available")
+            return None
+        
+        try:
+            # Check if file exists
+            from pathlib import Path
+            path = Path(file_path)
+            if not path.exists():
+                logger.error(f"Image file does not exist: {file_path}")
+                return None
+            
+            # Check file size
+            file_size = path.stat().st_size
+            logger.info(f"Uploading image: {file_path}, size: {file_size} bytes")
+            
+            if file_size == 0:
+                logger.error(f"Image file is empty: {file_path}")
+                return None
+            
+            if file_size > 10 * 1024 * 1024:  # 10MB limit per Feishu API docs
+                logger.error(f"Image file too large: {file_size} bytes (max 10MB)")
+                return None
+            
+            # Read file content
+            with open(file_path, 'rb') as f:
+                file_content = f.read()
+            
+            # Check if content was read
+            if not file_content:
+                logger.error(f"Failed to read file content: {file_path}")
+                return None
+            
+            # Log file header (first 8 bytes) to detect format
+            header = file_content[:8].hex()
+            logger.info(f"File header (hex): {header}")
+            
+            # Detect actual image format from magic numbers
+            magic_numbers = {
+                b'\xff\xd8\xff': 'JPEG',
+                b'\x89PNG\r\n\x1a\n': 'PNG',
+                b'GIF87a': 'GIF87a',
+                b'GIF89a': 'GIF89a',
+                b'RIFF': 'WEBP',
+                b'BM': 'BMP',
+            }
+            
+            detected_format = None
+            for magic, fmt in magic_numbers.items():
+                if file_content.startswith(magic):
+                    detected_format = fmt
+                    break
+            
+            if detected_format:
+                logger.info(f"Detected image format: {detected_format}")
+            else:
+                logger.warning(f"Unknown image format, header: {header}")
+            
+            # Build request to upload image
+            # image_type: "message" for chat messages, "avatar" for user avatars
+            # Use BytesIO to wrap the file content as required by lark-oapi SDK
+            from io import BytesIO
+            
+            image_data = BytesIO(file_content)
+            image_data.name = path.name  # Set filename with extension
+            
+            request = CreateImageRequest.builder() \
+                .request_body(
+                    CreateImageRequestBody.builder()
+                    .image_type("message")
+                    .image(image_data)
+                    .build()
+                ).build()
+            
+            logger.info(f"Uploading with BytesIO wrapper, filename: {path.name}")
+            
+            response = self._client.im.v1.image.create(request)
+            
+            if not response.success():
+                logger.error(
+                    f"Failed to upload image: code={response.code}, "
+                    f"msg={response.msg}, log_id={response.get_log_id()}"
+                )
+                logger.error(f"Image details - path: {file_path}, size: {file_size} bytes, "
+                           f"detected_format: {detected_format}, header: {header}")
+                return None
+            
+            image_key = response.data.image_key
+            logger.info(f"Uploaded image to Feishu: {image_key}")
+            return image_key
+            
+        except Exception as e:
+            logger.error(f"Error uploading image to Feishu: {e}")
+            return None
+    
+    def _upload_file_sync(self, file_path: str) -> str | None:
+        """
+        Sync helper for uploading file to Feishu.
+        
+        Args:
+            file_path: Local path to the file
+            
+        Returns:
+            File key if successful, None otherwise
+        """
+        if not self._client or not CreateFileRequest:
+            logger.warning("Feishu client or CreateFileRequest not available")
+            return None
+        
+        try:
+            # Check if file exists
+            path = Path(file_path)
+            if not path.exists():
+                logger.error(f"File does not exist: {file_path}")
+                return None
+            
+            # Check file size
+            file_size = path.stat().st_size
+            logger.info(f"Uploading file: {file_path}, size: {file_size} bytes")
+            
+            if file_size == 0:
+                logger.error(f"File is empty: {file_path}")
+                return None
+            
+            if file_size > 30 * 1024 * 1024:  # 30MB limit per Feishu API docs
+                logger.error(f"File too large: {file_size} bytes (max 30MB)")
+                return None
+            
+            # Read file content
+            with open(file_path, 'rb') as f:
+                file_content = f.read()
+            
+            # Check if content was read
+            if not file_content:
+                logger.error(f"Failed to read file content: {file_path}")
+                return None
+            
+            # Get file name from path
+            file_name = path.name
+            
+            # Determine file type based on extension
+            # According to Feishu API docs, file_type must be one of: opus, mp4, pdf, doc, xls
+            ext = path.suffix.lower()
+            
+            # Map file extensions to Feishu file_type values
+            ext_to_type = {
+                # Audio files (must be OPUS format for Feishu)
+                '.opus': 'opus',
+                # Video files
+                '.mp4': 'mp4',
+                # Document files
+                '.pdf': 'pdf',
+                '.doc': 'doc',
+                '.docx': 'doc',
+                '.xls': 'xls',
+                '.xlsx': 'xls',
+            }
+            
+            # Get file_type from extension mapping
+            file_type = ext_to_type.get(ext, 'file')
+            
+            # Note: For audio files other than OPUS, they need to be converted first
+            # For now, we'll use 'file' type for unsupported formats
+            if ext in {'.mp3', '.m4a', '.ogg', '.wav', '.flac', '.aac', '.webm', '.mov', '.avi', '.mkv'}:
+                logger.warning(f"File type '{ext}' is not directly supported by Feishu API. "
+                             f"Audio files should be OPUS format, video files should be MP4 format. "
+                             f"Using 'file' type instead.")
+                file_type = 'file'
+            
+            logger.info(f"File type: {file_type}, extension: {ext}")
+            
+            # Use BytesIO to wrap the file content as required by lark-oapi SDK
+            from io import BytesIO
+            file_data = BytesIO(file_content)
+            file_data.name = file_name  # Set filename with extension
+            
+            # Build request to upload file
+            request = CreateFileRequest.builder() \
+                .request_body(
+                    CreateFileRequestBody.builder()
+                    .file_type(file_type)
+                    .file_name(file_name)
+                    .file(file_data)
+                    .build()
+                ).build()
+            
+            logger.info(f"Uploading with BytesIO wrapper, filename: {file_name}, type: {file_type}")
+            
+            response = self._client.im.v1.file.create(request)
+            
+            if not response.success():
+                logger.error(
+                    f"Failed to upload file: code={response.code}, "
+                    f"msg={response.msg}, log_id={response.get_log_id()}"
+                )
+                logger.error(f"File details - path: {file_path}, size: {file_size} bytes, "
+                           f"type: {file_type}, extension: {ext}")
+                return None
+            
+            file_key = response.data.file_key
+            logger.info(f"Uploaded file to Feishu: {file_key}")
+            return file_key
+            
+        except Exception as e:
+            logger.error(f"Error uploading file to Feishu: {e}")
+            return None
+    
+    async def _upload_media(self, file_path: str) -> tuple[str, str] | None:
+        """
+        Upload media file to Feishu.
+        
+        Args:
+            file_path: Local path to the media file
+            
+        Returns:
+            Tuple of (file_key, msg_type) if successful, None otherwise
+        """
+        # Determine file type based on extension
+        ext = Path(file_path).suffix.lower()
+        image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
+        
+        loop = asyncio.get_running_loop()
+        
+        if ext in image_exts:
+            # Upload as image
+            file_key = await loop.run_in_executor(None, self._upload_image_sync, file_path)
+            if file_key:
+                return (file_key, "image")
+        else:
+            # Upload as file
+            file_key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
+            if file_key:
+                return (file_key, "file")
+        
+        return None
     
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
@@ -314,33 +586,70 @@ class FeishuChannel(BaseChannel):
             else:
                 receive_id_type = "open_id"
             
-            # Build card with markdown + table support
-            elements = self._build_card_elements(msg.content)
-            card = {
-                "config": {"wide_screen_mode": True},
-                "elements": elements,
-            }
-            content = json.dumps(card, ensure_ascii=False)
+            # Handle media files first
+            if msg.media:
+                for media_path in msg.media:
+                    # Upload media file to Feishu
+                    result = await self._upload_media(media_path)
+                    if result:
+                        file_key, msg_type = result
+                        
+                        # Send media message
+                        # Note: image messages use "image_key", file messages use "file_key"
+                        if msg_type == "image":
+                            media_content = json.dumps({"image_key": file_key})
+                        else:
+                            media_content = json.dumps({"file_key": file_key})
+                        
+                        request = CreateMessageRequest.builder() \
+                            .receive_id_type(receive_id_type) \
+                            .request_body(
+                                CreateMessageRequestBody.builder()
+                                .receive_id(msg.chat_id)
+                                .msg_type(msg_type)
+                                .content(media_content)
+                                .build()
+                            ).build()
+                        
+                        response = self._client.im.v1.message.create(request)
+                        
+                        if not response.success():
+                            logger.error(
+                                f"Failed to send Feishu media message: code={response.code}, "
+                                f"msg={response.msg}, log_id={response.get_log_id()}"
+                            )
+                        else:
+                            logger.debug(f"Feishu {msg_type} message sent to {msg.chat_id}")
             
-            request = CreateMessageRequest.builder() \
-                .receive_id_type(receive_id_type) \
-                .request_body(
-                    CreateMessageRequestBody.builder()
-                    .receive_id(msg.chat_id)
-                    .msg_type("interactive")
-                    .content(content)
-                    .build()
-                ).build()
-            
-            response = self._client.im.v1.message.create(request)
-            
-            if not response.success():
-                logger.error(
-                    f"Failed to send Feishu message: code={response.code}, "
-                    f"msg={response.msg}, log_id={response.get_log_id()}"
-                )
-            else:
-                logger.debug(f"Feishu message sent to {msg.chat_id}")
+            # Send text content if present
+            if msg.content:
+                # Build card with markdown + table support
+                elements = self._build_card_elements(msg.content)
+                card = {
+                    "config": {"wide_screen_mode": True},
+                    "elements": elements,
+                }
+                content = json.dumps(card, ensure_ascii=False)
+                
+                request = CreateMessageRequest.builder() \
+                    .receive_id_type(receive_id_type) \
+                    .request_body(
+                        CreateMessageRequestBody.builder()
+                        .receive_id(msg.chat_id)
+                        .msg_type("interactive")
+                        .content(content)
+                        .build()
+                    ).build()
+                
+                response = self._client.im.v1.message.create(request)
+                
+                if not response.success():
+                    logger.error(
+                        f"Failed to send Feishu message: code={response.code}, "
+                        f"msg={response.msg}, log_id={response.get_log_id()}"
+                    )
+                else:
+                    logger.debug(f"Feishu message sent to {msg.chat_id}")
                 
         except Exception as e:
             logger.error(f"Error sending Feishu message: {e}")
@@ -400,21 +709,32 @@ class FeishuChannel(BaseChannel):
                 # Handle media files (image, file, audio, video)
                 try:
                     content_data = json.loads(message.content)
+                    
+                    # Try different key names for file_key
                     file_key = content_data.get("file_key")
+                    if not file_key and msg_type == "image":
+                        # Image messages might use "image_key" instead
+                        file_key = content_data.get("image_key")
                     
                     if file_key:
                         # Download the file
+                        logger.info(f"Found file_key: {file_key[:16]}... for message {message_id}")
                         file_path = await self._download_file(file_key, msg_type, message_id)
                         if file_path:
                             media_paths.append(file_path)
                             content_parts.append(f"[{msg_type}: {file_path}]")
+                            logger.info(f"Successfully downloaded {msg_type} to {file_path}")
                         else:
                             content_parts.append(f"[{msg_type}: download failed]")
+                            logger.warning(f"Failed to download {msg_type} with file_key {file_key[:16]}...")
                     else:
                         # No file_key, just use placeholder
                         content_parts.append(MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]"))
+                        logger.warning(f"No file_key found in message content for type {msg_type}")
+                        logger.debug(f"Message content: {message.content}")
                 except json.JSONDecodeError:
                     content_parts.append(MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]"))
+                    logger.error(f"Failed to parse message content as JSON: {message.content[:200]}")
             
             # Check for caption or additional text
             if hasattr(message, 'content') and msg_type != "text":

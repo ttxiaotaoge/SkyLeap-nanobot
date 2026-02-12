@@ -40,7 +40,7 @@ class AgentLoop:
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
-        max_iterations: int = 20,
+        max_iterations: int = 2000000,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
